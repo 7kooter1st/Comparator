@@ -1,0 +1,274 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "PDF & DOCX Comparator API",
+    "description": "API для сравнения содержимого двух документов (DOCX и/или PDF). Формат каждого файла определяется автоматически. DOCX конвертируется через docx2txt, PDF распознаётся через Tesseract OCR. Сравнение выполняется после удаления всех пробельных символов.",
+    "version": "1.1.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:5000",
+      "description": "Локальный сервер разработки"
+    }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Проверка работоспособности сервиса",
+        "operationId": "healthCheck",
+        "responses": {
+          "200": {
+            "description": "Сервис доступен",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/compare": {
+      "post": {
+        "tags": ["Compare"],
+        "summary": "Сравнить два файла (DOCX и/или PDF)",
+        "description": "Принимает два файла в любом порядке и сочетании форматов. PDF распознаётся двумя моделями: PaddleOCR (основная) и Tesseract (контрольная). Если обе модели показывают расхождение — возвращается результат Tesseract с кодом 422.",
+        "operationId": "compareDocuments",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/CompareRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Сравнение выполнено успешно",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompareResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Некорректный запрос",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Файл превышает допустимый размер",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Ошибка обработки или обе OCR-модели показали расхождение (в теле — результат Tesseract)"
+          },
+          "503": {
+            "description": "Tesseract OCR недоступен (нужен для PDF)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CompareRequest": {
+        "type": "object",
+        "required": ["file1", "file2"],
+        "properties": {
+          "file1": {
+            "type": "string",
+            "format": "binary",
+            "description": "Первый файл (.docx или .pdf). Формат определяется автоматически."
+          },
+          "file2": {
+            "type": "string",
+            "format": "binary",
+            "description": "Второй файл (.docx или .pdf). Формат определяется автоматически."
+          },
+          "docx": {
+            "type": "string",
+            "format": "binary",
+            "description": "Устаревшее поле (вместо file1). Поддерживается для обратной совместимости."
+          },
+          "pdf": {
+            "type": "string",
+            "format": "binary",
+            "description": "Устаревшее поле (вместо file2). Поддерживается для обратной совместимости."
+          }
+        }
+      },
+      "FileInfo": {
+        "type": "object",
+        "properties": {
+          "filename": {
+            "type": "string",
+            "example": "document.docx"
+          },
+          "format": {
+            "type": "string",
+            "enum": ["docx", "pdf"],
+            "description": "Автоматически определённый формат файла"
+          },
+          "text": {
+            "type": "string",
+            "description": "Извлечённый текст"
+          }
+        },
+        "required": ["filename", "format", "text"]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": {
+            "type": "string",
+            "example": "ok"
+          },
+          "service": {
+            "type": "string",
+            "example": "PDF & DOCX Comparator"
+          }
+        },
+        "required": ["status", "service"]
+      },
+      "DiffSummary": {
+        "type": "object",
+        "properties": {
+          "total_differences": {
+            "type": "integer",
+            "example": 3
+          },
+          "only_in_file1": {
+            "type": "integer",
+            "description": "Фрагменты, присутствующие только в первом файле"
+          },
+          "only_in_file2": {
+            "type": "integer",
+            "description": "Фрагменты, присутствующие только во втором файле"
+          },
+          "changed": {
+            "type": "integer",
+            "description": "Фрагменты с изменённым содержимым"
+          }
+        },
+        "required": ["total_differences", "only_in_file1", "only_in_file2", "changed"]
+      },
+      "DifferenceEntry": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["only_in_file1", "only_in_file2", "changed"]
+          },
+          "file1": {
+            "type": "string",
+            "nullable": true,
+            "description": "Фрагмент из первого файла с пробелами"
+          },
+          "file2": {
+            "type": "string",
+            "nullable": true,
+            "description": "Фрагмент из второго файла с пробелами"
+          }
+        },
+        "required": ["type"]
+      },
+      "CompareResponse": {
+        "type": "object",
+        "properties": {
+          "file1": {
+            "$ref": "#/components/schemas/FileInfo"
+          },
+          "file2": {
+            "$ref": "#/components/schemas/FileInfo"
+          },
+          "content_identical": {
+            "type": "boolean",
+            "description": "true если нормализованные тексты (без пробелов) полностью совпадают"
+          },
+          "similarity_percent": {
+            "type": "number",
+            "format": "float"
+          },
+          "normalized_file1_length": {
+            "type": "integer"
+          },
+          "normalized_file2_length": {
+            "type": "integer"
+          },
+          "diff_summary": {
+            "$ref": "#/components/schemas/DiffSummary"
+          },
+          "differences": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DifferenceEntry"
+            }
+          },
+          "ocr_engine_used": {
+            "type": "string",
+            "enum": ["paddle", "tesseract"],
+            "description": "Какая OCR-модель использована в основном результате"
+          },
+          "ocr_validation_failed": {
+            "type": "boolean",
+            "description": "true если обе модели показали расхождение — возвращён Tesseract"
+          },
+          "message": {
+            "type": "string",
+            "description": "Пояснение при ocr_validation_failed=true"
+          }
+        },
+        "required": [
+          "file1",
+          "file2",
+          "content_identical",
+          "similarity_percent",
+          "normalized_file1_length",
+          "normalized_file2_length",
+          "diff_summary",
+          "differences",
+          "ocr_engine_used",
+          "ocr_validation_failed"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "hint": {
+            "type": "string"
+          }
+        },
+        "required": ["error"]
+      }
+    }
+  }
+}
