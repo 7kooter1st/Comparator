@@ -1,10 +1,16 @@
 from flask import Blueprint, jsonify, request
 
-from app.config import MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB
+from app.config import MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB, PADDLEOCR_USE_GPU
 from app.services.document_compare import compare_uploaded_files
 from app.services.file_converter import UnsupportedFormatError
+from app.services.ocr_profiles import (
+    OcrMode,
+    paddle_gpu_available,
+    resolve_ocr_profile,
+    resolve_paddle_use_gpu,
+)
 from app.services.pdf_converter import TesseractNotFoundError
-from app.services.paddle_converter import PaddleOcrNotAvailableError
+from app.services.paddle_converter import PaddleOcrNotAvailableError, paddle_gpu_enabled
 from app.services.tesseract_setup import check_tesseract
 
 compare_bp = Blueprint("compare", __name__)
@@ -82,6 +88,20 @@ def health():
             "paddleocr": {
                 "available": paddle_available,
                 "error": paddle_error,
+                "gpu_available": paddle_gpu_available(),
+                "gpu_enabled": paddle_gpu_enabled(),
+            },
+            "ocr_modes": {
+                "default": OcrMode.ACCURATE.value,
+                "supported": [OcrMode.FAST.value, OcrMode.ACCURATE.value],
+                "fast": {
+                    "dual_ocr": False,
+                    "description": "Только Tesseract, меньший zoom, параллель по страницам",
+                },
+                "accurate": {
+                    "dual_ocr": True,
+                    "description": "Tesseract + PaddleOCR параллельно, Paddle на GPU если доступен",
+                },
             },
         }
     )
@@ -104,8 +124,23 @@ def compare():
     if error2:
         return error2
 
+    mode_param = request.form.get("mode") or request.args.get("mode")
     try:
-        result = compare_uploaded_files(filename1, content1, filename2, content2)
+        profile = resolve_ocr_profile(
+            mode_param,
+            paddle_use_gpu=resolve_paddle_use_gpu(PADDLEOCR_USE_GPU),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    try:
+        result = compare_uploaded_files(
+            filename1,
+            content1,
+            filename2,
+            content2,
+            profile,
+        )
     except UnsupportedFormatError as exc:
         return jsonify({"error": str(exc)}), 400
     except TesseractNotFoundError as exc:

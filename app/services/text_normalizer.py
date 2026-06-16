@@ -137,6 +137,24 @@ def normalize_text(text: str) -> str:
     return "".join(normalized for _, normalized in pairs)
 
 
+def normalized_forms_equal(word1: str | None, word2: str | None) -> bool:
+    """Строгое совпадение нормализованных форм (для решения «изменено / нет»)."""
+    if word1 is None or word2 is None:
+        return word1 is None and word2 is None
+
+    n1 = normalize_word_for_compare(word1)
+    n2 = normalize_word_for_compare(word2)
+
+    if not n1 or not n2:
+        return not n1 and not n2
+    return n1 == n2
+
+
+def words_equivalent_for_ocr_locate(word1: str | None, word2: str | None) -> bool:
+    """Fuzzy-сопоставление — только для поиска позиции слова в OCR."""
+    return words_equivalent(word1, word2, fuzzy=True)
+
+
 def words_equivalent(word1: str | None, word2: str | None, *, fuzzy: bool = True) -> bool:
     if word1 is None or word2 is None:
         return word1 is None and word2 is None

@@ -3,8 +3,6 @@ from dataclasses import dataclass
 import fitz
 import numpy as np
 
-from app.config import PDF_RENDER_ZOOM
-
 
 @dataclass
 class PageImage:
@@ -12,13 +10,13 @@ class PageImage:
     png_bytes: bytes
 
 
-def render_pdf_pages(content: bytes) -> list[PageImage]:
+def render_pdf_pages(content: bytes, *, zoom: float) -> list[PageImage]:
     """Рендерит страницы PDF для OCR (numpy RGB + PNG bytes)."""
     doc = fitz.open(stream=content, filetype="pdf")
     pages: list[PageImage] = []
 
     try:
-        matrix = fitz.Matrix(PDF_RENDER_ZOOM, PDF_RENDER_ZOOM)
+        matrix = fitz.Matrix(zoom, zoom)
         for page_index in range(len(doc)):
             page = doc.load_page(page_index)
             pixmap = page.get_pixmap(matrix=matrix)

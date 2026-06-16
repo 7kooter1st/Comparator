@@ -1,9 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from app.services.comparator import compare_documents, compare_reference_with_dual_ocr
 from app.services.docx_converter import docx_to_text
 from app.services.file_converter import FileFormat, detect_format
-from app.services.pdf_ocr import pdf_dual_ocr
+from app.services.ocr_profiles import OcrProfile
+from app.services.pdf_ocr import pdf_ocr
 
 
 @dataclass
@@ -17,22 +19,22 @@ class ExtractedFile:
     paddle_error: str | None = None
 
 
-def _extract_file(filename: str, content: bytes) -> ExtractedFile:
+def _extract_file(filename: str, content: bytes, profile: OcrProfile) -> ExtractedFile:
     fmt = detect_format(filename, content)
 
     if fmt == FileFormat.DOCX:
         text = docx_to_text(content)
         return ExtractedFile(filename=filename, format=fmt, text=text)
 
-    dual = pdf_dual_ocr(content)
+    ocr_result = pdf_ocr(content, profile)
     return ExtractedFile(
         filename=filename,
         format=fmt,
-        text=dual.tesseract_text,
-        tesseract_text=dual.tesseract_text,
-        paddle_text=dual.paddle_text,
-        paddle_fallback=dual.paddle_fallback,
-        paddle_error=dual.paddle_error,
+        text=ocr_result.tesseract_text,
+        tesseract_text=ocr_result.tesseract_text,
+        paddle_text=ocr_result.paddle_text,
+        paddle_fallback=ocr_result.paddle_fallback,
+        paddle_error=ocr_result.paddle_error,
     )
 
 
@@ -50,14 +52,27 @@ def _file_payload(file: ExtractedFile) -> dict:
     return payload
 
 
+def _response_meta(profile: OcrProfile, ocr_engine: str, comparison_mode: str) -> dict:
+    return {
+        "ocr_mode": profile.mode.value,
+        "ocr_profile": profile.to_dict(),
+        "ocr_engine_used": ocr_engine,
+        "comparison_mode": comparison_mode,
+    }
+
+
 def compare_uploaded_files(
     filename1: str,
     content1: bytes,
     filename2: str,
     content2: bytes,
+    profile: OcrProfile,
 ) -> dict:
-    file1 = _extract_file(filename1, content1)
-    file2 = _extract_file(filename2, content2)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        file1_future = executor.submit(_extract_file, filename1, content1, profile)
+        file2_future = executor.submit(_extract_file, filename2, content2, profile)
+        file1 = file1_future.result()
+        file2 = file2_future.result()
 
     docx_file: ExtractedFile | None = None
     pdf_file: ExtractedFile | None = None
@@ -67,15 +82,14 @@ def compare_uploaded_files(
     elif file2.format == FileFormat.DOCX and file1.format == FileFormat.PDF:
         docx_file, pdf_file = file2, file1
 
-    if docx_file and pdf_file and pdf_file.tesseract_text and pdf_file.paddle_text:
-        if pdf_file.paddle_fallback:
-            result = compare_documents(docx_file.text, pdf_file.tesseract_text)
-            message = (
-                f"PaddleOCR недоступен ({pdf_file.paddle_error}). "
-                "Сравнение только через Tesseract."
-            )
-            ocr_engine = "tesseract"
-        else:
+    if docx_file and pdf_file and pdf_file.tesseract_text:
+        use_dual = (
+            profile.dual_ocr
+            and pdf_file.paddle_text
+            and not pdf_file.paddle_fallback
+        )
+
+        if use_dual:
             result = compare_reference_with_dual_ocr(
                 reference_text=docx_file.text,
                 ocr_tesseract=pdf_file.tesseract_text,
@@ -92,6 +106,20 @@ def compare_uploaded_files(
                     "Документы совпадают. На каждой позиции хотя бы одна "
                     "OCR-модель подтвердила эталонный текст."
                 )
+            comparison_mode = "reference_docx_vs_dual_ocr"
+        else:
+            result = compare_documents(docx_file.text, pdf_file.tesseract_text)
+            if pdf_file.paddle_fallback:
+                message = (
+                    f"PaddleOCR недоступен ({pdf_file.paddle_error}). "
+                    "Сравнение только через Tesseract."
+                )
+            elif profile.dual_ocr:
+                message = "Сравнение через Tesseract (dual OCR недоступен)."
+            else:
+                message = "Быстрый режим: сравнение только через Tesseract."
+            ocr_engine = "tesseract"
+            comparison_mode = "reference_docx_vs_tesseract"
 
         response = {
             "file1": _file_payload(file1),
@@ -102,9 +130,8 @@ def compare_uploaded_files(
             "normalized_file2_length": result["normalized_file2_length"],
             "diff_summary": result["diff_summary"],
             "differences": result["differences"],
-            "ocr_engine_used": ocr_engine,
-            "comparison_mode": "reference_docx_vs_dual_ocr",
             "message": message,
+            **_response_meta(profile, ocr_engine, comparison_mode),
         }
         if "ocr_filter_stats" in result:
             response["ocr_filter_stats"] = result["ocr_filter_stats"]
@@ -120,6 +147,6 @@ def compare_uploaded_files(
         "normalized_file2_length": result["normalized_file2_length"],
         "diff_summary": result["diff_summary"],
         "differences": result["differences"],
-        "ocr_engine_used": "direct",
-        "comparison_mode": "direct",
+        "message": "Прямое сравнение извлечённого текста.",
+        **_response_meta(profile, "direct", "direct"),
     }

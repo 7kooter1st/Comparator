@@ -1,0 +1,52 @@
+# Пример конфигурации nginx для Comparator.
+# Скопируйте в /etc/nginx/sites-available/comparator и включите сайт.
+#
+#   sudo cp deploy/nginx.conf.example /etc/nginx/sites-available/comparator
+#   sudo ln -s /etc/nginx/sites-available/comparator /etc/nginx/sites-enabled/
+#   sudo nginx -t && sudo systemctl reload nginx
+#
+# Перед этим запустите backend через gunicorn (не python run.py):
+#   gunicorn -w 2 -b 127.0.0.1:5000 --timeout 300 run:app
+
+server {
+    listen 80;
+    server_name comparator.example.com;   # замените на ваш домен или IP
+
+    client_max_body_size 25M;             # как MAX_FILE_SIZE_MB в .env
+
+    # Статика Vite — отдаёт nginx напрямую (быстрее)
+    root /home/maxim/Рабочий стол/Comparator/Comparator/dist;
+    index index.html;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    # SPA: все остальные маршруты → index.html
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}
+
+# Вариант «всё через Flask» (проще, но медленнее для статики):
+#
+# server {
+#     listen 80;
+#     server_name comparator.example.com;
+#     client_max_body_size 25M;
+#
+#     location / {
+#         proxy_pass http://127.0.0.1:5000;
+#         proxy_http_version 1.1;
+#         proxy_set_header Host $host;
+#         proxy_set_header X-Real-IP $remote_addr;
+#         proxy_read_timeout 300s;
+#     }
+# }
