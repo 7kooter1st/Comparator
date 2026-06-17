@@ -1,14 +1,10 @@
-import threading
-from concurrent.futures import ThreadPoolExecutor
+import os
 
 import numpy as np
 
-from app.config import PADDLEOCR_HOME, PADDLEOCR_LANG, PADDLEOCR_USE_ANGLE_CLS, PADDLEOCR_USE_GPU
-from app.services.ocr_profiles import resolve_paddle_use_gpu
-from app.services.pdf_images import PageImage
+from app.config import PADDLEOCR_HOME, PADDLEOCR_LANG, PADDLEOCR_USE_ANGLE_CLS
 
-_paddle_ocr_cache: dict[tuple[bool, bool, str], object] = {}
-_paddle_lock = threading.Lock()
+_paddle_ocr = None
 
 
 class PaddleOcrNotAvailableError(Exception):
@@ -16,8 +12,6 @@ class PaddleOcrNotAvailableError(Exception):
 
 
 def _ensure_paddleocr_home() -> None:
-    import os
-
     home = PADDLEOCR_HOME.rstrip("/\\") + os.sep
     os.makedirs(home, exist_ok=True)
     os.environ["PADDLEOCR_HOME"] = home
@@ -27,35 +21,31 @@ def _ensure_paddleocr_home() -> None:
     paddleocr_module.BASE_DIR = home
 
 
-def get_paddle_ocr(*, use_gpu: bool):
-    cache_key = (use_gpu, PADDLEOCR_USE_ANGLE_CLS, PADDLEOCR_LANG)
-    if cache_key in _paddle_ocr_cache:
-        return _paddle_ocr_cache[cache_key]
+def get_paddle_ocr():
+    global _paddle_ocr
+    if _paddle_ocr is None:
+        try:
+            import paddle  # noqa: F401
+        except ImportError as exc:
+            raise PaddleOcrNotAvailableError(
+                "paddlepaddle не установлен. Нужен Python 3.10–3.12."
+            ) from exc
 
-    try:
-        import paddle  # noqa: F401
-    except ImportError as exc:
-        raise PaddleOcrNotAvailableError(
-            "paddlepaddle не установлен. Нужен Python 3.10–3.12."
-        ) from exc
+        _ensure_paddleocr_home()
 
-    _ensure_paddleocr_home()
+        try:
+            from paddleocr import PaddleOCR
+        except ImportError as exc:
+            raise PaddleOcrNotAvailableError(
+                "PaddleOCR не установлен: pip install -r requirements-paddle.txt"
+            ) from exc
 
-    try:
-        from paddleocr import PaddleOCR
-    except ImportError as exc:
-        raise PaddleOcrNotAvailableError(
-            "PaddleOCR не установлен: pip install -r requirements-paddle.txt"
-        ) from exc
-
-    instance = PaddleOCR(
-        use_angle_cls=PADDLEOCR_USE_ANGLE_CLS,
-        lang=PADDLEOCR_LANG,
-        show_log=False,
-        use_gpu=use_gpu,
-    )
-    _paddle_ocr_cache[cache_key] = instance
-    return instance
+        _paddle_ocr = PaddleOCR(
+            use_angle_cls=PADDLEOCR_USE_ANGLE_CLS,
+            lang=PADDLEOCR_LANG,
+            show_log=False,
+        )
+    return _paddle_ocr
 
 
 def _unwrap_page_detections(ocr_result) -> list:
@@ -133,40 +123,15 @@ def _lines_from_page_result(ocr_result) -> list[list[str]]:
     return lines
 
 
-def _paddle_page_lines(page: PageImage, ocr) -> list[list[str]]:
-    with _paddle_lock:
+def _paddle_text_from_pages(pages: list) -> str:
+    ocr = get_paddle_ocr()
+    all_lines: list[list[str]] = []
+    for page in pages:
         result = ocr.ocr(page.rgb, cls=PADDLEOCR_USE_ANGLE_CLS)
-    return _lines_from_page_result(result)
-
-
-def _paddle_from_pages(
-    pages: list[PageImage],
-    *,
-    page_workers: int,
-    use_gpu: bool,
-) -> str:
-    if not pages:
-        return ""
-
-    ocr = get_paddle_ocr(use_gpu=use_gpu)
-    workers = 1 if use_gpu else min(page_workers, len(pages))
-
-    if workers <= 1:
-        all_lines: list[list[str]] = []
-        for page in pages:
-            all_lines.extend(_paddle_page_lines(page, ocr))
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            page_results = list(
-                executor.map(
-                    lambda page: _paddle_page_lines(page, ocr),
-                    pages,
-                )
-            )
-        all_lines = [line for page_lines in page_results for line in page_lines]
+        all_lines.extend(_lines_from_page_result(result))
 
     return "\n".join(" ".join(line) for line in all_lines).strip()
 
 
-def paddle_gpu_enabled() -> bool:
-    return resolve_paddle_use_gpu(PADDLEOCR_USE_GPU)
+def _paddle_from_pages(pages: list) -> str:
+    return _paddle_text_from_pages(pages)

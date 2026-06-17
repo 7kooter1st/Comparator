@@ -1,4 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from app.services.comparator import compare_documents, compare_reference_with_dual_ocr
@@ -68,11 +67,9 @@ def compare_uploaded_files(
     content2: bytes,
     profile: OcrProfile,
 ) -> dict:
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        file1_future = executor.submit(_extract_file, filename1, content1, profile)
-        file2_future = executor.submit(_extract_file, filename2, content2, profile)
-        file1 = file1_future.result()
-        file2 = file2_future.result()
+    # PDF OCR тяжёлый — не запускаем два полных OCR-пайплайна одновременно
+    file1 = _extract_file(filename1, content1, profile)
+    file2 = _extract_file(filename2, content2, profile)
 
     docx_file: ExtractedFile | None = None
     pdf_file: ExtractedFile | None = None

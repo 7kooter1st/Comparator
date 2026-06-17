@@ -18,13 +18,26 @@ TESSERACT_PSM = int(os.getenv("TESSERACT_PSM", "6"))
 TESSERACT_OEM = int(os.getenv("TESSERACT_OEM", "1"))
 
 PDF_RENDER_ZOOM = float(os.getenv("PDF_RENDER_ZOOM", "3.0"))
-PDF_RENDER_ZOOM_FAST = float(os.getenv("PDF_RENDER_ZOOM_FAST", "2.0"))
-PDF_RENDER_ZOOM_ACCURATE = float(
-    os.getenv("PDF_RENDER_ZOOM_ACCURATE", os.getenv("PDF_RENDER_ZOOM", "3.0"))
+
+# Предобработка изображений через Leptonica перед OCR (Linux: libleptonica-dev)
+LEPTONICA_PREPROCESS = os.getenv("LEPTONICA_PREPROCESS", "true").lower() in (
+    "1",
+    "true",
+    "yes",
 )
-OCR_PAGE_WORKERS = max(1, int(os.getenv("OCR_PAGE_WORKERS", str(min(8, os.cpu_count() or 4)))))
-PADDLEOCR_USE_GPU = os.getenv("PADDLEOCR_USE_GPU", "auto")
-DEFAULT_OCR_MODE = os.getenv("DEFAULT_OCR_MODE", "accurate").strip().lower()
+LEPTONICA_DESKEW = os.getenv("LEPTONICA_DESKEW", "true").lower() in ("1", "true", "yes")
+LEPTONICA_DENOISE = os.getenv("LEPTONICA_DENOISE", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+LEPTONICA_BINARIZE = os.getenv("LEPTONICA_BINARIZE", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+LEPTONICA_MEDIAN_KERNEL = max(1, int(os.getenv("LEPTONICA_MEDIAN_KERNEL", "2")))
+LEPTONICA_OTSU_TILE = max(8, int(os.getenv("LEPTONICA_OTSU_TILE", "20")))
 PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "ru")
 PADDLEOCR_USE_ANGLE_CLS = os.getenv("PADDLEOCR_USE_ANGLE_CLS", "").lower() in (
     "1",

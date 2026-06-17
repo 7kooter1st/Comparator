@@ -1,16 +1,12 @@
 from flask import Blueprint, jsonify, request
 
-from app.config import MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB, PADDLEOCR_USE_GPU
+from app.config import MAX_FILE_SIZE_BYTES, MAX_FILE_SIZE_MB
 from app.services.document_compare import compare_uploaded_files
 from app.services.file_converter import UnsupportedFormatError
-from app.services.ocr_profiles import (
-    OcrMode,
-    paddle_gpu_available,
-    resolve_ocr_profile,
-    resolve_paddle_use_gpu,
-)
+from app.services.ocr_profiles import OcrMode, resolve_ocr_profile
 from app.services.pdf_converter import TesseractNotFoundError
-from app.services.paddle_converter import PaddleOcrNotAvailableError, paddle_gpu_enabled
+from app.services.paddle_converter import PaddleOcrNotAvailableError
+from app.services.leptonica_preprocess import check_leptonica
 from app.services.tesseract_setup import check_tesseract
 
 compare_bp = Blueprint("compare", __name__)
@@ -72,6 +68,7 @@ def _resolve_upload_pair():
 @compare_bp.route("/health", methods=["GET"])
 def health():
     tesseract = check_tesseract()
+    leptonica = check_leptonica()
     paddle_available = True
     paddle_error = None
     try:
@@ -85,22 +82,26 @@ def health():
             "status": "ok" if tesseract["available"] and paddle_available else "degraded",
             "service": "PDF & DOCX Comparator",
             "tesseract": tesseract,
+            "leptonica": {
+                "available": leptonica.available,
+                "library": leptonica.library,
+                "preprocess_enabled": leptonica.preprocess_enabled,
+                "error": leptonica.error,
+            },
             "paddleocr": {
                 "available": paddle_available,
                 "error": paddle_error,
-                "gpu_available": paddle_gpu_available(),
-                "gpu_enabled": paddle_gpu_enabled(),
             },
             "ocr_modes": {
                 "default": OcrMode.ACCURATE.value,
                 "supported": [OcrMode.FAST.value, OcrMode.ACCURATE.value],
                 "fast": {
                     "dual_ocr": False,
-                    "description": "Только Tesseract, меньший zoom, параллель по страницам",
+                    "description": "Только Tesseract, последовательная обработка страниц",
                 },
                 "accurate": {
                     "dual_ocr": True,
-                    "description": "Tesseract + PaddleOCR параллельно, Paddle на GPU если доступен",
+                    "description": "Tesseract, затем PaddleOCR последовательно (dual confirmed)",
                 },
             },
         }
@@ -126,10 +127,7 @@ def compare():
 
     mode_param = request.form.get("mode") or request.args.get("mode")
     try:
-        profile = resolve_ocr_profile(
-            mode_param,
-            paddle_use_gpu=resolve_paddle_use_gpu(PADDLEOCR_USE_GPU),
-        )
+        profile = resolve_ocr_profile(mode_param)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
