@@ -1,0 +1,235 @@
+openapi: 3.0.3
+info:
+  title: Document Comparator API
+  description: |
+    Chunking & Producer + WebSocket Gateway: приём документов, chunking, Kafka,
+    проксирование прогресса и результата от Processing Service (:5001).
+
+    **Пайплайн:**
+    1. Фронтенд → `POST /api/compare` — chunking → Kafka `raw_chunks` → `job_id`
+    2. Фронтенд → WebSocket `ws://localhost:5000/ws/jobs/{job_id}` — прогресс и результат
+    3. Chunking Service → Processing Service (:5001) — REST + upstream WebSocket relay
+    4. Processing Service — Ollama, `processed_results`, `status_updates`
+
+    Swagger UI: `http://localhost:5000/docs`
+    Frontend UI: `http://localhost:5000/`
+  version: 4.1.0
+
+servers:
+  - url: http://localhost:5000
+    description: Локальный бэкенд (Chunking & Producer)
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Проверка Chunking Service и Processing Service
+      operationId: health
+      responses:
+        "200":
+          description: Статус сервисов
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /api/compare:
+    post:
+      tags: [Compare]
+      summary: Разбить два файла на чанки и отправить в Kafka
+      description: |
+        Принимает два файла, определяет формат, конвертирует (docx→txt, pdf→image),
+        разбивает на чанки и публикует в Kafka topic `raw_chunks`.
+        Возвращает `job_id` и статус `queued` без ожидания Ollama.
+      operationId: compare
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/CompareRequest"
+      responses:
+        "200":
+          description: Задача поставлена в очередь Kafka
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CompareResponse"
+        "400":
+          description: Некорректный запрос
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "413":
+          description: Файл слишком большой
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Kafka недоступна
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/result:
+    post:
+      tags: [Compare]
+      summary: Разобрать ответ Ollama для фронтенда
+      description: |
+        Принимает ответ Ollama от Consumer/Aggregator, извлекает JSON сравнения
+        из `message.content` и возвращает структурированный результат.
+      operationId: result
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResultRequest"
+      responses:
+        "200":
+          description: Результат сравнения
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResultResponse"
+        "422":
+          description: Не удалось разобрать ответ модели
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    CompareRequest:
+      type: object
+      required: [file1, file2]
+      properties:
+        file1:
+          type: string
+          format: binary
+          description: Первый файл (.pdf или .docx)
+        file2:
+          type: string
+          format: binary
+          description: Второй файл (.pdf или .docx)
+
+    FileChunkStats:
+      type: object
+      required: [filename, format, chunks]
+      properties:
+        filename:
+          type: string
+        format:
+          type: string
+          enum: [pdf, docx]
+        chunks:
+          type: integer
+          description: Число чанков этого файла
+
+    CompareResponse:
+      type: object
+      required: [job_id, status, total_chunks, kafka_topic, file1, file2]
+      properties:
+        job_id:
+          type: string
+          format: uuid
+          description: ID задачи (ключ сообщений Kafka)
+        status:
+          type: string
+          example: queued
+        total_chunks:
+          type: integer
+          description: Число сообщений в raw_chunks
+        kafka_topic:
+          type: string
+          example: raw_chunks
+        websocket_url:
+          type: string
+          example: ws://localhost:5000/ws/jobs/550e8400-e29b-41d4-a716-446655440000
+        file1:
+          $ref: "#/components/schemas/FileChunkStats"
+        file2:
+          $ref: "#/components/schemas/FileChunkStats"
+
+    RawChunkMessage:
+      type: object
+      description: Пример payload в Kafka topic raw_chunks
+      properties:
+        job_id:
+          type: string
+        document_id:
+          type: string
+        chunk_index:
+          type: integer
+        total_chunks:
+          type: integer
+        file1:
+          type: object
+          nullable: true
+          properties:
+            filename:
+              type: string
+            format:
+              type: string
+            content_type:
+              type: string
+              enum: [text, image]
+            content:
+              type: string
+              description: Текст или base64 PNG
+        file2:
+          type: object
+          nullable: true
+
+    ResultRequest:
+      type: object
+      required: [ollama]
+      properties:
+        ollama:
+          type: object
+          description: Ответ Ollama от Consumer/Aggregator
+
+    LineDifference:
+      type: object
+      properties:
+        line_number:
+          type: integer
+          nullable: true
+        file1_line:
+          type: string
+          nullable: true
+        file2_line:
+          type: string
+          nullable: true
+
+    ComparisonResult:
+      type: object
+      required: [identical, differences]
+      properties:
+        identical:
+          type: boolean
+        differences:
+          type: array
+          items:
+            $ref: "#/components/schemas/LineDifference"
+
+    ResultResponse:
+      type: object
+      required: [comparison]
+      properties:
+        comparison:
+          $ref: "#/components/schemas/ComparisonResult"
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        hint:
+          type: string
+          nullable: true

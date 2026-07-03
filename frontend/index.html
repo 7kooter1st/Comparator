@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Сравнение документов</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      line-height: 1.5;
+    }
+    body {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2rem 1rem;
+    }
+    h1 { margin-top: 0; }
+    .card {
+      border: 1px solid #ccc;
+      border-radius: 12px;
+      padding: 1rem 1.25rem;
+      margin-bottom: 1rem;
+    }
+    label { display: block; margin-bottom: 0.75rem; }
+    input[type="file"] { display: block; margin-top: 0.25rem; }
+    button {
+      padding: 0.6rem 1.2rem;
+      border-radius: 8px;
+      border: none;
+      background: #2563eb;
+      color: white;
+      font-size: 1rem;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #log {
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.9rem;
+      min-height: 220px;
+      background: rgba(127,127,127,0.08);
+      border-radius: 8px;
+      padding: 1rem;
+      overflow: auto;
+    }
+    .ok { color: #15803d; }
+    .err { color: #b91c1c; }
+    .meta { opacity: 0.8; font-size: 0.95rem; }
+  </style>
+</head>
+<body>
+  <h1>Сравнение документов</h1>
+  <p class="meta">
+    Фронтенд → Chunking Service (:5000) → Kafka → Processing Service (:5001) → WebSocket
+  </p>
+
+  <div class="card">
+    <label>
+      Документ 1 (.pdf / .docx)
+      <input id="file1" type="file" accept=".pdf,.docx" />
+    </label>
+    <label>
+      Документ 2 (.pdf / .docx)
+      <input id="file2" type="file" accept=".pdf,.docx" />
+    </label>
+    <button id="submitBtn">Сравнить</button>
+  </div>
+
+  <div class="card">
+    <div id="jobMeta" class="meta">Задача не запущена</div>
+    <div id="log"></div>
+  </div>
+
+  <script>
+    const API_BASE = window.location.origin;
+    const logEl = document.getElementById("log");
+    const jobMetaEl = document.getElementById("jobMeta");
+    const submitBtn = document.getElementById("submitBtn");
+    let ws = null;
+
+    function appendLog(text, cls = "") {
+      const line = document.createElement("div");
+      if (cls) line.className = cls;
+      line.textContent = text;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function wsUrlFromResponse(data) {
+      if (data.websocket_url) return data.websocket_url;
+      const wsBase = API_BASE.replace(/^http/, "ws");
+      return `${wsBase}/ws/jobs/${data.job_id}`;
+    }
+
+    function connectJobWebSocket(data) {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+
+      const url = wsUrlFromResponse(data);
+      appendLog(`WebSocket → ${url}`);
+      ws = new WebSocket(url);
+
+      ws.onopen = () => appendLog("WebSocket подключён", "ok");
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "status") {
+            const s = msg.data;
+            appendLog(
+              `[status] ${s.processed_chunks}/${s.total_chunks} — ${s.message || s.status}`
+            );
+            jobMetaEl.textContent = `job_id: ${msg.job_id} | ${s.status}`;
+          } else if (msg.type === "result") {
+            appendLog("[result] Сравнение завершено", "ok");
+            appendLog(JSON.stringify(msg.data, null, 2));
+            jobMetaEl.textContent = `job_id: ${msg.job_id} | completed`;
+            submitBtn.disabled = false;
+          } else if (msg.type === "error") {
+            appendLog(`[error] ${msg.data.message}`, "err");
+            submitBtn.disabled = false;
+          } else {
+            appendLog(event.data);
+          }
+        } catch {
+          appendLog(event.data);
+        }
+      };
+      ws.onerror = () => appendLog("WebSocket ошибка", "err");
+      ws.onclose = () => appendLog("WebSocket закрыт");
+
+      setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send("ping");
+      }, 25000);
+    }
+
+    submitBtn.addEventListener("click", async () => {
+      const f1 = document.getElementById("file1").files[0];
+      const f2 = document.getElementById("file2").files[0];
+      if (!f1 || !f2) {
+        appendLog("Выберите оба файла", "err");
+        return;
+      }
+
+      submitBtn.disabled = true;
+      logEl.innerHTML = "";
+      appendLog("Отправка файлов в Chunking Service...");
+
+      const form = new FormData();
+      form.append("file1", f1);
+      form.append("file2", f2);
+
+      try {
+        const response = await fetch(`${API_BASE}/api/compare`, {
+          method: "POST",
+          body: form,
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || data.detail || response.statusText);
+        }
+
+        appendLog(`Задача поставлена: job_id=${data.job_id}`, "ok");
+        appendLog(
+          `Чанков: ${data.total_chunks} (file1=${data.file1.chunks}, file2=${data.file2.chunks})`
+        );
+        jobMetaEl.textContent = `job_id: ${data.job_id} | queued`;
+        connectJobWebSocket(data);
+      } catch (err) {
+        appendLog(String(err.message || err), "err");
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
