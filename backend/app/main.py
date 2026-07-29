@@ -3,7 +3,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -18,11 +18,8 @@ from app.schemas import (
     ResultRequest,
     ResultResponse,
 )
-from app.services.chunk_builder import build_raw_chunk_messages
-from app.services.files import PdfConversionError, prepare_file
+from app.services.compare_jobs import run_compare_pipeline
 from app.services.kafka_producer import (
-    KafkaProducerError,
-    publish_raw_chunks,
     start_kafka_producer,
     stop_kafka_producer,
 )
@@ -34,7 +31,24 @@ from app.services.ws_relay import relay_job_to_client
 setup_logging()
 logger = logging.getLogger(__name__)
 
-FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DIST_DIR = ROOT_DIR / "dist"
+LEGACY_FRONTEND_DIR = ROOT_DIR / "frontend"
+# Production Vite build takes priority over the old single-file frontend.
+FRONTEND_DIR = (
+    DIST_DIR
+    if (DIST_DIR / "index.html").is_file()
+    else LEGACY_FRONTEND_DIR
+)
+_RESERVED_FRONTEND_PREFIXES = (
+    "api/",
+    "docs",
+    "redoc",
+    "openapi.json",
+    "health",
+    "ws/",
+    "static/",
+)
 
 
 @asynccontextmanager
@@ -69,7 +83,11 @@ app.add_middleware(
 )
 
 if FRONTEND_DIR.is_dir():
+    logger.info("Frontend static dir: %s", FRONTEND_DIR)
     app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+    assets_dir = FRONTEND_DIR / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
 
 async def _read_upload(upload: UploadFile, field_name: str) -> tuple[bytes, str]:
@@ -105,7 +123,10 @@ async def frontend_index():
         return FileResponse(index_path)
     return JSONResponse(
         status_code=404,
-        content={"error": "Frontend not found", "hint": "Создайте frontend/index.html"},
+        content={
+            "error": "Frontend not found",
+            "hint": "Положите Vite build в dist/ или создайте frontend/index.html",
+        },
     )
 
 
@@ -141,75 +162,39 @@ async def health() -> dict:
     summary="Разбить два файла на чанки и отправить в Kafka",
 )
 async def compare(
+    background_tasks: BackgroundTasks,
     file1: UploadFile = File(..., description="Первый файл (.pdf или .docx)"),
     file2: UploadFile = File(..., description="Второй файл (.pdf или .docx)"),
 ) -> CompareResponse:
     content1, name1 = await _read_upload(file1, "file1")
     content2, name2 = await _read_upload(file2, "file2")
 
-    try:
-        prepared1 = prepare_file(content1, name1)
-        prepared2 = prepare_file(content2, name2)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
-    except PdfConversionError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "Ошибка конвертации PDF", "hint": str(exc)},
-        ) from exc
-
     job_id = str(uuid.uuid4())
+    ws_url = settings.job_websocket_url(job_id)
+    background_tasks.add_task(
+        run_compare_pipeline,
+        job_id,
+        content1,
+        name1,
+        content2,
+        name2,
+    )
     logger.info(
-        "[Compare] job_id=%s | file1=%s (%s) | file2=%s (%s)",
+        "[Compare] job_id=%s accepted | file1=%s | file2=%s | ws=%s (chunking in background)",
         job_id,
         name1,
-        prepared1.format,
         name2,
-        prepared2.format,
-    )
-    build_result = build_raw_chunk_messages(job_id, prepared1, prepared2)
-    logger.info(
-        "[Compare] job_id=%s | чанков: total=%s file1=%s file2=%s",
-        job_id,
-        len(build_result.messages),
-        build_result.chunks1,
-        build_result.chunks2,
-    )
-
-    try:
-        await publish_raw_chunks(job_id, build_result.messages)
-    except KafkaProducerError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error": "Не удалось опубликовать задачу в Kafka",
-                "hint": str(exc),
-            },
-        ) from exc
-
-    ws_url = settings.job_websocket_url(job_id)
-    logger.info(
-        "[Compare ✓] job_id=%s queued | ws=%s",
-        job_id,
         ws_url,
     )
 
     return CompareResponse(
         job_id=job_id,
-        status="queued",
-        total_chunks=len(build_result.messages),
+        status="preparing",
+        total_chunks=0,
         kafka_topic=settings.kafka_topic_raw_chunks,
         websocket_url=ws_url,
-        file1=FileChunkStats(
-            filename=name1,
-            format=prepared1.format,
-            chunks=build_result.chunks1,
-        ),
-        file2=FileChunkStats(
-            filename=name2,
-            format=prepared2.format,
-            chunks=build_result.chunks2,
-        ),
+        file1=FileChunkStats(filename=name1, format="pending", chunks=0),
+        file2=FileChunkStats(filename=name2, format="pending", chunks=0),
     )
 
 
@@ -262,3 +247,28 @@ async def http_exception_handler(_request, exc: HTTPException):
         status_code=exc.status_code,
         content={"error": str(exc.detail)},
     )
+
+
+@app.get("/{file_path:path}", include_in_schema=False)
+async def frontend_spa(file_path: str):
+    """Serve Vite dist files (favicon, icons, SPA routes). /assets is mounted above."""
+    if any(
+        file_path == prefix.rstrip("/") or file_path.startswith(prefix)
+        for prefix in _RESERVED_FRONTEND_PREFIXES
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    candidate = (FRONTEND_DIR / file_path).resolve()
+    try:
+        candidate.relative_to(FRONTEND_DIR.resolve())
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Not found") from exc
+
+    if candidate.is_file():
+        return FileResponse(candidate)
+
+    index_path = FRONTEND_DIR / "index.html"
+    if index_path.is_file():
+        return FileResponse(index_path)
+
+    raise HTTPException(status_code=404, detail="Frontend not found")

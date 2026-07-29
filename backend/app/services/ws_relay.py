@@ -16,12 +16,12 @@ from app.services.processing_client import (
     get_job_result,
     get_job_status,
 )
+from app.services.compare_jobs import peek_prepare_error
 
 logger = logging.getLogger(__name__)
 
-# How long to retry 404 JobNotFound before giving up (Processing may not
-# have registered the job yet while Kafka chunks are still in flight).
-_JOB_NOT_FOUND_GRACE_SEC = 60.0
+# Chunking (Word/PDF) may take several minutes before Kafka publish.
+_JOB_NOT_FOUND_GRACE_SEC = 600.0
 
 
 def _status_event(job_id: str, data: dict) -> str:
@@ -153,6 +153,20 @@ async def _poll_processing_api(
     while not done.is_set() and client_ws.client_state == WebSocketState.CONNECTED:
         poll_count += 1
         logger.info("[Polling] job_id=%s попытка #%s", job_id, poll_count)
+
+        prepare_error = peek_prepare_error(job_id)
+        if prepare_error:
+            msg = _error_event(
+                job_id,
+                "Ошибка подготовки документов",
+                {"hint": prepare_error},
+            )
+            async with send_lock:
+                if client_ws.client_state == WebSocketState.CONNECTED and not done.is_set():
+                    _log_ws_event("Polling→Frontend", job_id, msg)
+                    await client_ws.send_text(msg)
+            done.set()
+            return
 
         # Prefer result endpoint — Aggregator may already have finalized JSON
         # even if status relay never reached the frontend over WS.

@@ -9,8 +9,8 @@ class Settings(BaseSettings):
     )
 
     max_upload_mb: int = 50
-    pdf_render_dpi: int = 100
-    image_max_width: int = 1024
+    pdf_render_dpi: int = 200
+    image_max_width: int = 2048
     text_chunk_max_chars: int = 1500
 
     kafka_bootstrap_servers: str = "localhost:9092"

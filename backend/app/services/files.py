@@ -1,17 +1,28 @@
 import base64
 import io
-import re
-from dataclasses import dataclass
+import logging
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
-import docx2txt
 import fitz
 from PIL import Image
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
+# Константы Word (без импорта win32.constants для совместимости)
+_WD_STATISTIC_PAGES = 2
+_WD_GOTO_PAGE = 1
+_WD_GOTO_ABSOLUTE = 1
+
 
 class PdfConversionError(Exception):
+    pass
+
+
+class DocxConversionError(Exception):
     pass
 
 
@@ -21,6 +32,7 @@ class PreparedFile:
     format: str
     text: str | None
     images: list[bytes]
+    text_pages: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -42,8 +54,92 @@ def detect_format(filename: str) -> str:
     raise ValueError(f"Неподдерживаемый формат: {ext or '(нет расширения)'}")
 
 
-def docx_to_text(content: bytes) -> str:
-    return (docx2txt.process(io.BytesIO(content)) or "").strip()
+def _require_win32():
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError as exc:
+        raise DocxConversionError(
+            "Не установлен pywin32. Выполните: pip install pywin32"
+        ) from exc
+    return pythoncom, win32com.client
+
+
+def _get_docx_page_range(word, doc, page: int, total_pages: int):
+    """Возвращает Range одной страницы документа Word."""
+    word.Selection.GoTo(What=_WD_GOTO_PAGE, Which=_WD_GOTO_ABSOLUTE, Count=page)
+    start = word.Selection.Start
+
+    if page < total_pages:
+        word.Selection.GoTo(What=_WD_GOTO_PAGE, Which=_WD_GOTO_ABSOLUTE, Count=page + 1)
+        end = word.Selection.Start
+    else:
+        end = doc.Content.End
+
+    return doc.Range(Start=start, End=end)
+
+
+def docx_to_page_texts(content: bytes) -> list[str]:
+    """
+    Извлекает текст DOCX постранично через Microsoft Word (как в split_docx_by_pages).
+    Требует Windows + установленный Word + pywin32.
+    """
+    pythoncom, win32 = _require_win32()
+
+    tmp_path: Path | None = None
+    word = None
+    com_initialized = False
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+            tmp.write(content)
+            tmp_path = Path(tmp.name).resolve()
+
+        pythoncom.CoInitialize()
+        com_initialized = True
+
+        word = win32.Dispatch("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+
+        doc = word.Documents.Open(str(tmp_path), ReadOnly=True)
+        try:
+            total_pages = int(doc.ComputeStatistics(_WD_STATISTIC_PAGES))
+            if total_pages < 1:
+                raise DocxConversionError(
+                    "Word не смог определить количество страниц в документе."
+                )
+
+            pages: list[str] = []
+            for page in range(1, total_pages + 1):
+                page_range = _get_docx_page_range(word, doc, page, total_pages)
+                text = (page_range.Text or "").replace("\r", "\n").strip()
+                pages.append(text)
+
+            logger.info(
+                "DOCX разбит по страницам Word: pages=%s file=%s",
+                len(pages),
+                tmp_path.name,
+            )
+            return pages or [""]
+        finally:
+            doc.Close(SaveChanges=False)
+    except DocxConversionError:
+        raise
+    except Exception as exc:
+        raise DocxConversionError(
+            f"Не удалось разбить DOCX по страницам через Word: {exc}"
+        ) from exc
+    finally:
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception:
+                logger.exception("Не удалось закрыть Word.Application")
+        if com_initialized:
+            pythoncom.CoUninitialize()
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def _resize_png(image_bytes: bytes) -> bytes:
@@ -89,54 +185,16 @@ def pdf_to_images(content: bytes, dpi: int | None = None) -> list[bytes]:
     return images
 
 
-def split_text_to_chunks(text: str, max_chars: int | None = None) -> list[str]:
-    """Разбивает текст на логические фрагменты, не превышающие лимит символов."""
-    max_chars = max_chars or settings.text_chunk_max_chars
-    text = text.strip()
-    if not text:
-        return [""]
-
-    paragraphs = re.split(r"\n\s*\n", text)
-    chunks: list[str] = []
-    current = ""
-
-    for paragraph in paragraphs:
-        paragraph = paragraph.strip()
-        if not paragraph:
-            continue
-
-        if len(paragraph) > max_chars:
-            if current:
-                chunks.append(current.strip())
-                current = ""
-            start = 0
-            while start < len(paragraph):
-                chunks.append(paragraph[start : start + max_chars].strip())
-                start += max_chars
-            continue
-
-        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
-        if len(candidate) <= max_chars:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current.strip())
-            current = paragraph
-
-    if current:
-        chunks.append(current.strip())
-
-    return chunks or [""]
-
-
 def prepare_file(content: bytes, filename: str) -> PreparedFile:
     file_format = detect_format(filename)
     if file_format == "docx":
+        pages = docx_to_page_texts(content)
         return PreparedFile(
             filename=filename,
             format=file_format,
-            text=docx_to_text(content),
+            text="\n\n".join(pages),
             images=[],
+            text_pages=pages,
         )
     return PreparedFile(
         filename=filename,
@@ -147,17 +205,17 @@ def prepare_file(content: bytes, filename: str) -> PreparedFile:
 
 
 def file_to_chunks(prepared: PreparedFile) -> list[ChunkPart]:
-    """DOCX → текстовые чанки; PDF → по одному PNG на страницу."""
+    """DOCX → по одному текстовому чанку на страницу Word; PDF → PNG на страницу."""
     if prepared.format == "docx":
-        text_chunks = split_text_to_chunks(prepared.text or "")
+        pages = prepared.text_pages or [prepared.text or ""]
         return [
             ChunkPart(
                 content_type="text",
-                content=chunk,
+                content=page,
                 filename=prepared.filename,
                 format=prepared.format,
             )
-            for chunk in text_chunks
+            for page in pages
         ]
 
     return [
