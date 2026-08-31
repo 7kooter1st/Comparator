@@ -16,6 +16,10 @@ class KafkaProducerError(Exception):
     pass
 
 
+def is_kafka_producer_ready() -> bool:
+    return _producer is not None
+
+
 def _chunk_summary(message: dict) -> str:
     parts = []
     for side in ("file1", "file2"):
@@ -35,12 +39,23 @@ async def start_kafka_producer() -> None:
     if _producer is not None:
         return
 
-    _producer = AIOKafkaProducer(
+    producer = AIOKafkaProducer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         acks="all",
         max_request_size=settings.kafka_max_request_size_bytes,
     )
-    await _producer.start()
+    try:
+        await producer.start()
+    except Exception:
+        # Do not leave a non-started object behind: publish_raw_chunks used to
+        # mistake it for a healthy producer and accept jobs that could not run.
+        try:
+            await producer.stop()
+        except Exception:
+            pass
+        raise
+
+    _producer = producer
     logger.info(
         "[Kafka] producer подключён: %s | topic=%s | max_request_size=%s",
         settings.kafka_bootstrap_servers,

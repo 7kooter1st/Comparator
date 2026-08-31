@@ -17,9 +17,11 @@ class Settings(BaseSettings):
     kafka_topic_raw_chunks: str = "raw_chunks"
     kafka_max_request_size_bytes: int = 10 * 1024 * 1024  # 10 MB, как KAFKA_MESSAGE_MAX_BYTES брокера
 
-    processing_service_url: str = "http://localhost:5001"
+    processing_service_url: str = "http://127.0.0.1:5001"
     processing_poll_interval_sec: float = 2.0
     processing_request_timeout_sec: float = 30.0
+    processing_registration_attempts: int = 3
+    processing_registration_retry_delay_sec: float = 1.0
 
     api_host: str = "0.0.0.0"
     api_port: int = 5000

@@ -16,7 +16,7 @@ from app.services.processing_client import (
     get_job_result,
     get_job_status,
 )
-from app.services.compare_jobs import peek_prepare_error
+from app.services.compare_jobs import get_pipeline_phase, peek_prepare_error
 
 logger = logging.getLogger(__name__)
 
@@ -192,11 +192,44 @@ async def _poll_processing_api(
             status = await get_job_status(job_id)
             not_found_since = None
         except JobNotFound:
+            phase = get_pipeline_phase(job_id)
+            # While Chunking is still preparing/publishing, 404 is expected if
+            # early registration failed — keep waiting and show local status.
+            if phase in (None, "preparing"):
+                local_status = {
+                    "job_id": job_id,
+                    "document_id": job_id,
+                    "status": "preparing",
+                    "processed_chunks": 0,
+                    "total_chunks": 0,
+                    "message": "Подготовка документов (Chunking)...",
+                }
+                signature = (0, "preparing")
+                if signature != last_signature:
+                    event = _status_event(job_id, local_status)
+                    async with send_lock:
+                        if client_ws.client_state == WebSocketState.CONNECTED and not done.is_set():
+                            _log_ws_event("Polling→Frontend", job_id, event)
+                            await client_ws.send_text(event)
+                    last_signature = signature
+                not_found_since = None
+                await asyncio.sleep(settings.processing_poll_interval_sec)
+                continue
+
             now = asyncio.get_running_loop().time()
             if not_found_since is None:
                 not_found_since = now
             elif now - not_found_since >= _JOB_NOT_FOUND_GRACE_SEC:
-                msg = _error_event(job_id, "Задача не найдена в Processing Service")
+                msg = _error_event(
+                    job_id,
+                    "Задача не найдена в Processing Service",
+                    {
+                        "hint": (
+                            "Processing не зарегистрировал задачу после публикации в Kafka. "
+                            "Проверьте, что Processing (:5001) и Kafka запущены."
+                        )
+                    },
+                )
                 logger.error("[Polling → Frontend] job_id=%s | задача не найдена (timeout)", job_id)
                 async with send_lock:
                     if client_ws.client_state == WebSocketState.CONNECTED:
@@ -204,8 +237,9 @@ async def _poll_processing_api(
                 done.set()
                 return
             logger.info(
-                "[Polling] job_id=%s: job ещё не в StateManager, ждём…",
+                "[Polling] job_id=%s: job ещё не в StateManager (phase=%s), ждём…",
                 job_id,
+                phase,
             )
             await asyncio.sleep(settings.processing_poll_interval_sec)
             continue

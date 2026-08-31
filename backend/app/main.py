@@ -18,13 +18,18 @@ from app.schemas import (
     ResultRequest,
     ResultResponse,
 )
-from app.services.compare_jobs import run_compare_pipeline
+from app.services.compare_jobs import mark_job_accepted, run_compare_pipeline
 from app.services.kafka_producer import (
+    is_kafka_producer_ready,
     start_kafka_producer,
     stop_kafka_producer,
 )
 from app.services.ollama import OllamaError, parse_comparison_result
-from app.services.processing_client import ProcessingServiceUnavailable, get_health
+from app.services.processing_client import (
+    ProcessingServiceUnavailable,
+    get_health,
+    register_job,
+)
 from app.logging_config import setup_logging
 from app.services.ws_relay import relay_job_to_client
 
@@ -53,10 +58,9 @@ _RESERVED_FRONTEND_PREFIXES = (
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    try:
-        await start_kafka_producer()
-    except Exception as exc:
-        logger.warning("Kafka producer не запущен при старте: %s", exc)
+    # A running HTTP server without Kafka accepts jobs that can never be
+    # processed. Fail startup instead and let the launcher report the cause.
+    await start_kafka_producer()
     yield
     await stop_kafka_producer()
 
@@ -132,7 +136,7 @@ async def frontend_index():
 
 @app.get("/health", tags=["Health"], summary="Проверка Chunking Service и Processing Service")
 async def health() -> dict:
-    kafka_ok = True
+    kafka_ok = is_kafka_producer_ready()
     processing_ok = False
     processing_status: dict | str = "unavailable"
 
@@ -143,7 +147,7 @@ async def health() -> dict:
         processing_status = str(exc)
 
     return {
-        "status": "ok" if kafka_ok else "degraded",
+        "status": "ok" if kafka_ok and processing_ok else "degraded",
         "kafka_producer": kafka_ok,
         "processing_service_reachable": processing_ok,
         "processing": processing_status,
@@ -166,11 +170,42 @@ async def compare(
     file1: UploadFile = File(..., description="Первый файл (.pdf или .docx)"),
     file2: UploadFile = File(..., description="Второй файл (.pdf или .docx)"),
 ) -> CompareResponse:
+    if not is_kafka_producer_ready():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Kafka недоступна",
+                "hint": "Запустите Kafka и перезапустите Chunking Service.",
+            },
+        )
+
     content1, name1 = await _read_upload(file1, "file1")
     content2, name2 = await _read_upload(file2, "file2")
 
     job_id = str(uuid.uuid4())
     ws_url = settings.job_websocket_url(job_id)
+    try:
+        await register_job(
+            job_id,
+            status="preparing",
+            message="Подготовка документов (Chunking)...",
+            required=True,
+        )
+    except ProcessingServiceUnavailable as exc:
+        logger.error("[Compare ✗] job_id=%s registration failed: %s", job_id, exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Processing Service не готов",
+                "hint": (
+                    "Задача не создана. Проверьте Processing (:5001), Kafka "
+                    "и запустите сервисы через start-all.bat."
+                ),
+            },
+        )
+
+    # Return a job_id only after Processing has confirmed registration.
+    mark_job_accepted(job_id)
     background_tasks.add_task(
         run_compare_pipeline,
         job_id,

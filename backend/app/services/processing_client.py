@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import httpx
@@ -44,6 +45,80 @@ async def get_health() -> dict:
     except httpx.HTTPError as exc:
         logger.error("[Processing ✗] health недоступен: %s", exc)
         raise ProcessingServiceUnavailable(f"Processing Service недоступен: {exc}") from exc
+
+
+async def register_job(
+    job_id: str,
+    *,
+    total_chunks: int = 0,
+    status: str = "queued",
+    message: str = "Ожидание чанков из Kafka...",
+    required: bool = False,
+) -> dict | None:
+    """Register a job before Kafka publication.
+
+    The initial registration is required: without it Chunking would return a
+    job_id that Processing does not know about. Later status refreshes remain
+    best-effort because Kafka also carries the job.
+    """
+    url = f"{_base_url()}/api/jobs"
+    payload = {
+        "job_id": job_id,
+        "document_id": job_id,
+        "total_chunks": total_chunks,
+        "status": status,
+        "message": message,
+    }
+    logger.info("[Processing ← POST] %s job_id=%s status=%s", url, job_id, status)
+    attempts = settings.processing_registration_attempts if required else 1
+    attempts = max(1, attempts)
+    last_error: httpx.HTTPError | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(
+                timeout=settings.processing_request_timeout_sec
+            ) as client:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                logger.info(
+                    "[Processing →] registered job_id=%s: %s",
+                    job_id,
+                    format_payload_for_log(data),
+                )
+                return data
+        except httpx.HTTPError as exc:
+            last_error = exc
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            retryable = status_code is None or status_code >= 500
+            if not retryable or attempt >= attempts:
+                break
+
+            delay = settings.processing_registration_retry_delay_sec * attempt
+            logger.warning(
+                "[Processing ✗] register job_id=%s failed "
+                "(attempt %s/%s): %s; retry in %.1fs",
+                job_id,
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    error = (
+        f"Processing Service не зарегистрировал задачу {job_id}: {last_error}"
+    )
+    if required:
+        raise ProcessingServiceUnavailable(error) from last_error
+
+    logger.warning(
+        "[Processing ✗] register job_id=%s failed (will rely on Kafka): %s",
+        job_id,
+        last_error,
+    )
+    return None
 
 
 async def get_job_status(job_id: str) -> dict:
