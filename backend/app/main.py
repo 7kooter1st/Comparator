@@ -3,13 +3,28 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, WebSocket
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    UploadFile,
+    WebSocket,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from app.config import settings
+from app.db import database
+from app.deps import authenticate_websocket, get_current_user
+from app.logging_config import setup_logging
+from app.models import AuthUser
+from app.routers.admin import router as admin_router
+from app.routers.auth import router as auth_router
+from app.routers.jobs import require_owned_job, router as jobs_router
 from app.schemas import (
     CompareResponse,
     ComparisonResult,
@@ -19,6 +34,7 @@ from app.schemas import (
     ResultResponse,
 )
 from app.services.compare_jobs import mark_job_accepted, run_compare_pipeline
+from app.services.file_store import save_original
 from app.services.kafka_producer import (
     is_kafka_producer_ready,
     start_kafka_producer,
@@ -30,7 +46,6 @@ from app.services.processing_client import (
     get_health,
     register_job,
 )
-from app.logging_config import setup_logging
 from app.services.ws_relay import relay_job_to_client
 
 setup_logging()
@@ -58,11 +73,15 @@ _RESERVED_FRONTEND_PREFIXES = (
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    settings.upload_dir.mkdir(parents=True, exist_ok=True)
+    await database.start()
+    await database.bootstrap_admin()
     # A running HTTP server without Kafka accepts jobs that can never be
     # processed. Fail startup instead and let the launcher report the cause.
     await start_kafka_producer()
     yield
     await stop_kafka_producer()
+    await database.stop()
 
 
 app = FastAPI(
@@ -71,7 +90,7 @@ app = FastAPI(
         "Chunking & Producer + WebSocket Gateway: приём PDF/DOCX, chunking, Kafka, "
         "проксирование прогресса и результата от Processing Service на фронтенд."
     ),
-    version="4.1.0",
+    version="5.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
@@ -80,11 +99,15 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(auth_router)
+app.include_router(admin_router)
+app.include_router(jobs_router)
 
 if FRONTEND_DIR.is_dir():
     logger.info("Frontend static dir: %s", FRONTEND_DIR)
@@ -94,7 +117,7 @@ if FRONTEND_DIR.is_dir():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
 
-async def _read_upload(upload: UploadFile, field_name: str) -> tuple[bytes, str]:
+async def _read_upload(upload: UploadFile, field_name: str) -> tuple[bytes, str, str]:
     if not upload.filename:
         raise HTTPException(
             status_code=400,
@@ -117,7 +140,8 @@ async def _read_upload(upload: UploadFile, field_name: str) -> tuple[bytes, str]
             },
         )
 
-    return content, upload.filename
+    content_type = upload.content_type or "application/octet-stream"
+    return content, upload.filename, content_type
 
 
 @app.get("/", include_in_schema=False)
@@ -159,6 +183,7 @@ async def health() -> dict:
     response_model=CompareResponse,
     responses={
         400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
         413: {"model": ErrorResponse},
         503: {"model": ErrorResponse},
     },
@@ -167,6 +192,7 @@ async def health() -> dict:
 )
 async def compare(
     background_tasks: BackgroundTasks,
+    user: AuthUser = Depends(get_current_user),
     file1: UploadFile = File(..., description="Первый файл (.pdf или .docx)"),
     file2: UploadFile = File(..., description="Второй файл (.pdf или .docx)"),
 ) -> CompareResponse:
@@ -174,33 +200,69 @@ async def compare(
         return JSONResponse(
             status_code=503,
             content={
-                "error": "Kafka недоступна",
-                "hint": "Запустите Kafka и перезапустите Chunking Service.",
+                "error": "Сервис временно недоступен",
+                "hint": "Попробуйте ещё раз через минуту.",
             },
         )
 
-    content1, name1 = await _read_upload(file1, "file1")
-    content2, name2 = await _read_upload(file2, "file2")
+    content1, name1, type1 = await _read_upload(file1, "file1")
+    content2, name2, type2 = await _read_upload(file2, "file2")
 
     job_id = str(uuid.uuid4())
+    user_id = str(user.id)
     ws_url = settings.job_websocket_url(job_id)
+    stored1 = save_original(
+        user_id=user_id,
+        job_id=job_id,
+        side=1,
+        filename=name1,
+        content=content1,
+        content_type=type1,
+    )
+    stored2 = save_original(
+        user_id=user_id,
+        job_id=job_id,
+        side=2,
+        filename=name2,
+        content=content2,
+        content_type=type2,
+    )
+
     try:
         await register_job(
             job_id,
+            user_id=user_id,
             status="preparing",
-            message="Подготовка документов (Chunking)...",
+            message="Подготовка документов…",
+            file1_name=name1,
+            file2_name=name2,
             required=True,
+        )
+        await database.insert_job_file(
+            job_id=job_id,
+            side=1,
+            original_filename=name1,
+            content_type=stored1["content_type"],
+            size_bytes=stored1["size_bytes"],
+            sha256=stored1["sha256"],
+            storage_path=stored1["storage_path"],
+        )
+        await database.insert_job_file(
+            job_id=job_id,
+            side=2,
+            original_filename=name2,
+            content_type=stored2["content_type"],
+            size_bytes=stored2["size_bytes"],
+            sha256=stored2["sha256"],
+            storage_path=stored2["storage_path"],
         )
     except ProcessingServiceUnavailable as exc:
         logger.error("[Compare ✗] job_id=%s registration failed: %s", job_id, exc)
         return JSONResponse(
             status_code=503,
             content={
-                "error": "Processing Service не готов",
-                "hint": (
-                    "Задача не создана. Проверьте Processing (:5001), Kafka "
-                    "и запустите сервисы через start-all.bat."
-                ),
+                "error": "Сервис обработки не готов",
+                "hint": "Задача не создана. Попробуйте ещё раз через минуту.",
             },
         )
 
@@ -213,10 +275,12 @@ async def compare(
         name1,
         content2,
         name2,
+        user_id,
     )
     logger.info(
-        "[Compare] job_id=%s accepted | file1=%s | file2=%s | ws=%s (chunking in background)",
+        "[Compare] job_id=%s user=%s accepted | file1=%s | file2=%s | ws=%s",
         job_id,
+        user.username,
         name1,
         name2,
         ws_url,
@@ -237,8 +301,20 @@ async def compare(
 async def job_websocket(websocket: WebSocket, job_id: str) -> None:
     """
     WebSocket для фронтенда: проксирует события status/result/error
-    от Processing Service (:5001).
+    от Processing Service (:5001) только владельцу задачи.
     """
+    user = await authenticate_websocket(websocket, database)
+    if user is None:
+        await websocket.close(code=4401, reason="Требуется вход")
+        return
+    job = await database.get_job(job_id)
+    try:
+        require_owned_job(job, user)
+    except HTTPException as exc:
+        code = 4404 if exc.status_code == 404 else 4403
+        await websocket.close(code=code, reason=str(exc.detail))
+        return
+
     try:
         await relay_job_to_client(job_id, websocket)
     except WebSocketDisconnect:
@@ -259,7 +335,10 @@ async def job_websocket(websocket: WebSocket, job_id: str) -> None:
     tags=["Compare"],
     summary="Разобрать ответ Ollama для фронтенда",
 )
-async def result(body: ResultRequest) -> ResultResponse:
+async def result(
+    body: ResultRequest,
+    _user: AuthUser = Depends(get_current_user),
+) -> ResultResponse:
     try:
         comparison = parse_comparison_result(body.ollama)
     except OllamaError as exc:

@@ -1,4 +1,9 @@
+from pathlib import Path
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_COMPARATOR_ROOT = Path(__file__).resolve().parents[3]
 
 
 class Settings(BaseSettings):
@@ -26,6 +31,34 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 5000
     public_base_url: str = "http://localhost:5000"
+
+    database_url: str = (
+        "postgresql://comparator:comparator@127.0.0.1:5432/comparator"
+    )
+    database_pool_min_size: int = 1
+    database_pool_max_size: int = 5
+
+    session_ttl_days: int = 14
+    cookie_secure: bool = False
+    session_cookie_name: str = "comparator_session"
+    cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    upload_dir: Path = _COMPARATOR_ROOT / "data" / "uploads"
+    bootstrap_admin_username: str = "admin"
+    bootstrap_admin_password: str = ""
+    internal_api_token: str = ""
+
+    @field_validator("upload_dir", mode="before")
+    @classmethod
+    def _parse_upload_dir(cls, value: object) -> Path:
+        if isinstance(value, Path):
+            return value
+        if isinstance(value, str) and value.strip():
+            return Path(value)
+        return _COMPARATOR_ROOT / "data" / "uploads"
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
     @property
     def max_upload_bytes(self) -> int:

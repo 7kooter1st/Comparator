@@ -202,7 +202,7 @@ async def _poll_processing_api(
                     "status": "preparing",
                     "processed_chunks": 0,
                     "total_chunks": 0,
-                    "message": "Подготовка документов (Chunking)...",
+                    "message": "Подготовка документов…",
                 }
                 signature = (0, "preparing")
                 if signature != last_signature:
@@ -222,11 +222,11 @@ async def _poll_processing_api(
             elif now - not_found_since >= _JOB_NOT_FOUND_GRACE_SEC:
                 msg = _error_event(
                     job_id,
-                    "Задача не найдена в Processing Service",
+                    "Задача не найдена. Попробуйте загрузить документы ещё раз.",
                     {
                         "hint": (
-                            "Processing не зарегистрировал задачу после публикации в Kafka. "
-                            "Проверьте, что Processing (:5001) и Kafka запущены."
+                            "Обработка не началась. Обновите страницу "
+                            "или создайте сравнение заново."
                         )
                     },
                 )

@@ -29,6 +29,13 @@ def _base_url() -> str:
     return settings.processing_service_url.rstrip("/")
 
 
+def _internal_headers() -> dict[str, str]:
+    token = settings.internal_api_token
+    if not token:
+        return {}
+    return {"X-Internal-Token": token}
+
+
 async def get_health() -> dict:
     url = f"{_base_url()}/health"
     logger.info("[Processing ← GET] %s", url)
@@ -50,9 +57,12 @@ async def get_health() -> dict:
 async def register_job(
     job_id: str,
     *,
+    user_id: str,
     total_chunks: int = 0,
     status: str = "queued",
-    message: str = "Ожидание чанков из Kafka...",
+    message: str = "Процесс в очереди",
+    file1_name: str = "",
+    file2_name: str = "",
     required: bool = False,
 ) -> dict | None:
     """Register a job before Kafka publication.
@@ -65,9 +75,12 @@ async def register_job(
     payload = {
         "job_id": job_id,
         "document_id": job_id,
+        "user_id": user_id,
         "total_chunks": total_chunks,
         "status": status,
         "message": message,
+        "file1_name": file1_name,
+        "file2_name": file2_name,
     }
     logger.info("[Processing ← POST] %s job_id=%s status=%s", url, job_id, status)
     attempts = settings.processing_registration_attempts if required else 1
@@ -79,7 +92,11 @@ async def register_job(
             async with httpx.AsyncClient(
                 timeout=settings.processing_request_timeout_sec
             ) as client:
-                response = await client.post(url, json=payload)
+                response = await client.post(
+                    url,
+                    json=payload,
+                    headers=_internal_headers(),
+                )
                 response.raise_for_status()
                 data = response.json()
                 logger.info(
@@ -126,7 +143,7 @@ async def get_job_status(job_id: str) -> dict:
     logger.info("[Processing ← GET] %s", url)
     try:
         async with httpx.AsyncClient(timeout=settings.processing_request_timeout_sec) as client:
-            response = await client.get(url)
+            response = await client.get(url, headers=_internal_headers())
             if response.status_code == 404:
                 logger.warning("[Processing →] job_id=%s: 404 not found", job_id)
                 raise JobNotFound(f"Job {job_id} not found")
@@ -151,7 +168,7 @@ async def get_job_result(job_id: str) -> dict:
     logger.info("[Processing ← GET] %s", url)
     try:
         async with httpx.AsyncClient(timeout=settings.processing_request_timeout_sec) as client:
-            response = await client.get(url)
+            response = await client.get(url, headers=_internal_headers())
             if response.status_code == 404:
                 logger.info("[Processing →] job_id=%s result: ещё не готов (404)", job_id)
                 raise ResultNotReady(f"Result for job {job_id} is not ready yet")

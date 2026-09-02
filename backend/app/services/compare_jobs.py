@@ -47,6 +47,7 @@ async def run_compare_pipeline(
     name1: str,
     content2: bytes,
     name2: str,
+    user_id: str,
 ) -> None:
     """Chunking + Kafka in background so HTTP can return before Cloudflare times out."""
     _prepare_errors.pop(job_id, None)
@@ -60,8 +61,11 @@ async def run_compare_pipeline(
 
     await register_job(
         job_id,
+        user_id=user_id,
         status="preparing",
-        message="Подготовка документов (Chunking)...",
+        message="Подготовка документов…",
+        file1_name=name1,
+        file2_name=name2,
     )
 
     try:
@@ -74,8 +78,11 @@ async def run_compare_pipeline(
         logger.error("[Compare BG ✗] job_id=%s prepare failed: %s", job_id, exc)
         await register_job(
             job_id,
+            user_id=user_id,
             status="failed",
             message=f"Ошибка подготовки документов: {exc}",
+            file1_name=name1,
+            file2_name=name2,
         )
         return
     except Exception as exc:
@@ -84,8 +91,11 @@ async def run_compare_pipeline(
         logger.exception("[Compare BG ✗] job_id=%s prepare failed", job_id)
         await register_job(
             job_id,
+            user_id=user_id,
             status="failed",
             message=f"Ошибка подготовки файлов: {exc}",
+            file1_name=name1,
+            file2_name=name2,
         )
         return
 
@@ -100,9 +110,12 @@ async def run_compare_pipeline(
 
     await register_job(
         job_id,
+        user_id=user_id,
         total_chunks=len(build_result.messages),
         status="queued",
-        message="Публикация чанков в Kafka...",
+        message="Процесс в очереди",
+        file1_name=name1,
+        file2_name=name2,
     )
 
     try:
@@ -113,17 +126,23 @@ async def run_compare_pipeline(
         logger.error("[Compare BG ✗] job_id=%s kafka failed: %s", job_id, exc)
         await register_job(
             job_id,
+            user_id=user_id,
             total_chunks=len(build_result.messages),
             status="failed",
-            message=f"Ошибка Kafka: {exc}",
+            message="Не удалось поставить задачу в очередь. Попробуйте ещё раз.",
+            file1_name=name1,
+            file2_name=name2,
         )
         return
 
     _set_phase(job_id, "queued")
     await register_job(
         job_id,
+        user_id=user_id,
         total_chunks=len(build_result.messages),
         status="queued",
-        message="Чанки в Kafka, ожидание Processing...",
+        message="Процесс в очереди",
+        file1_name=name1,
+        file2_name=name2,
     )
     logger.info("[Compare BG ✓] job_id=%s queued in Kafka", job_id)
