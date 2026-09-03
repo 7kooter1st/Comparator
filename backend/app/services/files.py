@@ -98,7 +98,7 @@ def docx_to_page_texts(content: bytes) -> list[str]:
         pythoncom.CoInitialize()
         com_initialized = True
 
-        word = win32.Dispatch("Word.Application")
+        word = win32.DispatchEx("Word.Application")
         word.Visible = False
         word.DisplayAlerts = 0
 

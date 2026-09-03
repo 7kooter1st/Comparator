@@ -103,7 +103,20 @@ class FakeDB:
     async def get_job_file(self, job_id: str, side: int):
         return self.files.get((job_id, side))
 
-    async def delete_job(self, job_id: str) -> bool:
+    async def get_comparison_result(self, job_id: str):
+        return None
+
+    async def request_cancel(self, job_id: str):
+        job = self.jobs.get(job_id)
+        if job is None:
+            return None
+        job["status"] = "cancel_requested"
+        return job
+
+    async def begin_delete(self, job_id: str):
+        return self.jobs.get(job_id)
+
+    async def finish_delete(self, job_id: str) -> bool:
         return self.jobs.pop(job_id, None) is not None
 
 

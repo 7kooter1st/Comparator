@@ -20,7 +20,12 @@ class Settings(BaseSettings):
 
     kafka_bootstrap_servers: str = "localhost:9092"
     kafka_topic_raw_chunks: str = "raw_chunks"
-    kafka_max_request_size_bytes: int = 10 * 1024 * 1024  # 10 MB, как KAFKA_MESSAGE_MAX_BYTES брокера
+    kafka_topic_prepare_word: str = "cmp.prepare.word.cmd.v1"
+    kafka_topic_prepare_pdf: str = "cmp.prepare.pdf.cmd.v1"
+    kafka_topic_ocr_cmd: str = "cmp.ocr.cmd.v1"
+    kafka_topic_job_event: str = "cmp.job.event.v1"
+    kafka_max_request_size_bytes: int = 10 * 1024 * 1024
+    kafka_replication_factor: int = 3
 
     processing_service_url: str = "http://127.0.0.1:5001"
     processing_poll_interval_sec: float = 2.0
@@ -31,6 +36,11 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 5000
     public_base_url: str = "http://localhost:5000"
+    pipeline_version: str = "v2"
+    worker_id: str = ""
+    word_timeout_seconds: float = 300.0
+    prepare_timeout_seconds: float = 600.0
+    expected_schema_revision: str = "0002_page_text"
 
     database_url: str = (
         "postgresql://comparator:comparator@127.0.0.1:5432/comparator"
@@ -42,19 +52,29 @@ class Settings(BaseSettings):
     cookie_secure: bool = False
     session_cookie_name: str = "comparator_session"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    upload_dir: Path = _COMPARATOR_ROOT / "data" / "uploads"
     bootstrap_admin_username: str = "admin"
     bootstrap_admin_password: str = ""
     internal_api_token: str = ""
 
-    @field_validator("upload_dir", mode="before")
+    object_store_backend: str = "s3"
+    object_store_root: Path = _COMPARATOR_ROOT / "data" / "objects"
+    s3_endpoint_url: str = "http://127.0.0.1:9000"
+    s3_access_key: str = "comparator"
+    s3_secret_key: str = "comparator-secret"
+    s3_bucket: str = "comparator"
+    s3_region: str = "us-east-1"
+    outbox_poll_interval_sec: float = 1.0
+    work_item_poll_interval_sec: float = 1.0
+    lease_seconds: int = 900
+
+    @field_validator("object_store_root", mode="before")
     @classmethod
-    def _parse_upload_dir(cls, value: object) -> Path:
+    def _parse_object_root(cls, value: object) -> Path:
         if isinstance(value, Path):
             return value
         if isinstance(value, str) and value.strip():
             return Path(value)
-        return _COMPARATOR_ROOT / "data" / "uploads"
+        return _COMPARATOR_ROOT / "data" / "objects"
 
     @property
     def cors_origin_list(self) -> list[str]:

@@ -7,6 +7,7 @@ import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
+from app.db import database
 from app.config import settings
 from app.logging_config import format_payload_for_log
 from app.services.processing_client import (
@@ -167,6 +168,45 @@ async def _poll_processing_api(
                     await client_ws.send_text(msg)
             done.set()
             return
+
+        db_job = await database.get_job(job_id)
+        if db_job is not None:
+            persisted = await database.get_comparison_result(job_id)
+            if persisted is not None:
+                event = _result_event(job_id, {"comparison": persisted})
+                async with send_lock:
+                    if client_ws.client_state == WebSocketState.CONNECTED and not done.is_set():
+                        await client_ws.send_text(event)
+                        done.set()
+                return
+            status_payload = {
+                "job_id": job_id,
+                "document_id": db_job.get("document_id", job_id),
+                "status": db_job.get("status"),
+                "processed_chunks": db_job.get("processed_chunks") or 0,
+                "total_chunks": db_job.get("total_chunks") or 0,
+                "message": db_job.get("last_message") or "",
+            }
+            signature = (
+                status_payload["processed_chunks"],
+                str(status_payload["status"]),
+            )
+            if signature != last_signature:
+                event = _status_event(job_id, status_payload)
+                async with send_lock:
+                    if client_ws.client_state == WebSocketState.CONNECTED and not done.is_set():
+                        await client_ws.send_text(event)
+                last_signature = signature
+            if db_job.get("status") in {"failed", "cancelled"}:
+                msg = _error_event(
+                    job_id,
+                    db_job.get("last_message") or "Сравнение завершилось с ошибкой",
+                )
+                async with send_lock:
+                    if client_ws.client_state == WebSocketState.CONNECTED:
+                        await client_ws.send_text(msg)
+                done.set()
+                return
 
         # Prefer result endpoint — Aggregator may already have finalized JSON
         # even if status relay never reached the frontend over WS.

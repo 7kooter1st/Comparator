@@ -3,14 +3,14 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.config import settings
 from app.db import Database
 from app.deps import get_current_user, get_db
 from app.models import AuthUser
-from app.services.file_store import delete_job_files, resolve_stored_path
+from app.services.object_store import get_object_store
 from app.services.processing_client import (
     JobNotFound,
     ProcessingServiceUnavailable,
@@ -33,6 +33,8 @@ class JobListItem(BaseModel):
     verdict: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    queue_position: int | None = None
+    active_count: int | None = None
     websocket_url: str | None = None
 
 
@@ -48,6 +50,8 @@ def _to_item(row: dict[str, Any]) -> JobListItem:
         verdict=row.get("verdict"),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
+        queue_position=row.get("queue_position"),
+        active_count=row.get("active_count"),
         websocket_url=settings.job_websocket_url(row["job_id"]),
     )
 
@@ -88,20 +92,6 @@ async def get_job(
     db: Database = Depends(get_db),
 ) -> JobListItem:
     job = require_owned_job(await db.get_job(job_id), user)
-    try:
-        remote = await get_job_status(job_id)
-        job = {
-            **job,
-            "status": remote.get("status", job["status"]),
-            "processed_chunks": remote.get(
-                "processed_chunks",
-                job.get("processed_chunks", 0),
-            ),
-            "total_chunks": remote.get("total_chunks", job.get("total_chunks", 0)),
-            "last_message": remote.get("message", job.get("last_message", "")),
-        }
-    except (JobNotFound, ProcessingServiceUnavailable):
-        pass
     return _to_item(job)
 
 
@@ -112,6 +102,9 @@ async def job_result(
     db: Database = Depends(get_db),
 ) -> dict[str, Any]:
     require_owned_job(await db.get_job(job_id), user)
+    persisted = await db.get_comparison_result(job_id)
+    if persisted is not None:
+        return {"comparison": persisted}
     try:
         return await get_job_result(job_id)
     except ResultNotReady as exc:
@@ -129,23 +122,24 @@ async def download_job_file(
     side: int,
     user: AuthUser = Depends(get_current_user),
     db: Database = Depends(get_db),
-) -> FileResponse:
+) -> Response:
     if side not in (1, 2):
         raise HTTPException(status_code=400, detail="side должен быть 1 или 2")
     require_owned_job(await db.get_job(job_id), user)
     stored = await db.get_job_file(job_id, side)
     if stored is None:
         raise HTTPException(status_code=404, detail="Файл не найден")
+    object_key = stored["storage_path"]
     try:
-        path = resolve_stored_path(stored["storage_path"])
-    except ValueError as exc:
+        data = await get_object_store().get_bytes(object_key)
+    except Exception as exc:
         raise HTTPException(status_code=404, detail="Файл не найден") from exc
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Файл отсутствует на диске")
-    return FileResponse(
-        path,
-        filename=stored["original_filename"],
+    return Response(
+        content=data,
         media_type=stored["content_type"],
+        headers={
+            "Content-Disposition": f'attachment; filename="{stored["original_filename"]}"'
+        },
     )
 
 
@@ -156,8 +150,26 @@ async def delete_job(
     db: Database = Depends(get_db),
 ) -> dict[str, bool]:
     job = require_owned_job(await db.get_job(job_id), user, allow_admin=True)
-    delete_job_files(str(job["user_id"]), job_id)
-    deleted = await db.delete_job(job_id)
+    await db.begin_delete(job_id)
+    try:
+        await get_object_store().delete_prefix(f"jobs/{job_id}")
+    except Exception:
+        logger = __import__("logging").getLogger(__name__)
+        logger.exception("object cleanup failed job=%s", job_id)
+    deleted = await db.finish_delete(job_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Задача не найдена")
     return {"ok": True}
+
+
+@router.post("/{job_id}/cancel")
+async def cancel_job(
+    job_id: str,
+    user: AuthUser = Depends(get_current_user),
+    db: Database = Depends(get_db),
+) -> dict[str, Any]:
+    require_owned_job(await db.get_job(job_id), user)
+    updated = await db.request_cancel(job_id)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return {"ok": True, "status": updated["status"]}

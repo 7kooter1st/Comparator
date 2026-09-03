@@ -81,8 +81,20 @@ class Database:
             command_timeout=30,
         )
         async with self._pool.acquire() as conn:
-            await conn.execute(SCHEMA_SQL)
-        logger.info("[POSTGRES] Chunking auth store connected")
+            revision = None
+            try:
+                revision = await conn.fetchval(
+                    "SELECT version_num FROM alembic_version"
+                )
+            except Exception:
+                revision = None
+            if revision != settings.expected_schema_revision:
+                raise RuntimeError(
+                    "PostgreSQL schema is not at the expected Alembic revision "
+                    f"{settings.expected_schema_revision} (got {revision!r}). "
+                    "Start Processing first so it can run migrations."
+                )
+        logger.info("[POSTGRES] Chunking connected schema=%s", revision)
 
     async def stop(self) -> None:
         if self._pool is not None:
@@ -373,7 +385,31 @@ class Database:
                 j.total_chunks,
                 j.created_at,
                 j.updated_at,
-                r.verdict
+                r.verdict,
+                CASE
+                    WHEN j.status IN (
+                        'completed', 'failed', 'cancelled', 'deleted'
+                    ) THEN NULL
+                    ELSE (
+                        SELECT COUNT(*)
+                        FROM comparison_jobs q
+                        WHERE q.user_id = j.user_id
+                          AND q.status IN (
+                              'queued', 'preparing', 'processing', 'ocr_ready',
+                              'comparing', 'classifying', 'finalizing'
+                          )
+                          AND q.created_at <= j.created_at
+                    )
+                END AS queue_position,
+                (
+                    SELECT COUNT(*)
+                    FROM comparison_jobs a
+                    WHERE a.user_id = j.user_id
+                      AND a.status IN (
+                          'queued', 'preparing', 'processing', 'ocr_ready',
+                          'comparing', 'classifying', 'finalizing'
+                      )
+                ) AS active_count
             FROM comparison_jobs j
             LEFT JOIN LATERAL (
                 SELECT verdict
@@ -383,6 +419,7 @@ class Database:
                 LIMIT 1
             ) r ON TRUE
             WHERE j.user_id = $1
+              AND j.status <> 'deleted'
             ORDER BY j.created_at DESC
         """
         query_plain = """
@@ -485,6 +522,84 @@ class Database:
         return [dict(row) for row in rows]
 
     async def delete_job(self, job_id: str) -> bool:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM comparison_jobs WHERE job_id = $1",
+                job_id,
+            )
+        return result == "DELETE 1"
+
+
+    @property
+    def pool(self) -> asyncpg.Pool:
+        return self._require_pool()
+
+    async def get_comparison_result(self, job_id: str) -> dict[str, Any] | None:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            value = await conn.fetchval(
+                """
+                SELECT comparison_json
+                FROM comparison_results
+                WHERE job_id = $1
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                job_id,
+            )
+        if value is None:
+            return None
+        if isinstance(value, str):
+            import json
+
+            return json.loads(value)
+        return dict(value) if not isinstance(value, dict) else value
+
+    async def request_cancel(self, job_id: str) -> dict[str, Any] | None:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE comparison_jobs
+                SET cancel_requested_at = COALESCE(cancel_requested_at, NOW()),
+                    status = CASE
+                        WHEN status IN ('completed', 'failed', 'cancelled', 'deleted', 'deleting')
+                        THEN status
+                        ELSE 'cancel_requested'
+                    END,
+                    last_message = CASE
+                        WHEN status IN ('completed', 'failed', 'cancelled', 'deleted', 'deleting')
+                        THEN last_message
+                        ELSE 'Отмена запрошена'
+                    END,
+                    state_version = state_version + 1,
+                    updated_at = NOW()
+                WHERE job_id = $1
+                RETURNING *
+                """,
+                job_id,
+            )
+        return None if row is None else dict(row)
+
+    async def begin_delete(self, job_id: str) -> dict[str, Any] | None:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE comparison_jobs
+                SET status = 'deleting',
+                    last_message = 'Удаление…',
+                    state_version = state_version + 1,
+                    updated_at = NOW()
+                WHERE job_id = $1 AND status <> 'deleted'
+                RETURNING *
+                """,
+                job_id,
+            )
+        return None if row is None else dict(row)
+
+    async def finish_delete(self, job_id: str) -> bool:
         pool = self._require_pool()
         async with pool.acquire() as conn:
             result = await conn.execute(

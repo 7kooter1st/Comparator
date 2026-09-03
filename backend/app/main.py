@@ -4,10 +4,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     File,
+    Header,
     HTTPException,
     UploadFile,
     WebSocket,
@@ -29,13 +29,14 @@ from app.schemas import (
     CompareResponse,
     ComparisonResult,
     ErrorResponse,
-    FileChunkStats,
     ResultRequest,
     ResultResponse,
 )
-from app.services.compare_jobs import mark_job_accepted, run_compare_pipeline
-from app.services.file_store import save_original
+from app.services.job_ingress import DurableJobIngress
+from app.services.object_store import get_object_store
+from app.services.outbox import OutboxPublisher
 from app.services.kafka_producer import (
+    get_kafka_producer,
     is_kafka_producer_ready,
     start_kafka_producer,
     stop_kafka_producer,
@@ -44,9 +45,10 @@ from app.services.ollama import OllamaError, parse_comparison_result
 from app.services.processing_client import (
     ProcessingServiceUnavailable,
     get_health,
-    register_job,
 )
 from app.services.ws_relay import relay_job_to_client
+from app.workers.prepare_worker import PrepareWorker
+from app.workflow.repository import WorkflowRepository
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -66,20 +68,41 @@ _RESERVED_FRONTEND_PREFIXES = (
     "redoc",
     "openapi.json",
     "health",
+    "live",
+    "ready",
+    "metrics",
     "ws/",
     "static/",
 )
 
+_outbox: OutboxPublisher | None = None
+_prepare_worker: PrepareWorker | None = None
+_ready = False
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    settings.upload_dir.mkdir(parents=True, exist_ok=True)
+    global _outbox, _prepare_worker, _ready
     await database.start()
     await database.bootstrap_admin()
-    # A running HTTP server without Kafka accepts jobs that can never be
-    # processed. Fail startup instead and let the launcher report the cause.
-    await start_kafka_producer()
+    try:
+        await start_kafka_producer()
+    except Exception:
+        logger.exception("[Kafka] producer unavailable at startup; outbox will retry")
+    producer = get_kafka_producer()
+    workflow = WorkflowRepository(database.pool)
+    if producer is not None:
+        _outbox = OutboxPublisher(workflow, producer)
+        await _outbox.start()
+    _prepare_worker = PrepareWorker(workflow, database.pool)
+    await _prepare_worker.start()
+    _ready = True
     yield
+    _ready = False
+    if _prepare_worker is not None:
+        await _prepare_worker.stop()
+    if _outbox is not None:
+        await _outbox.stop()
     await stop_kafka_producer()
     await database.stop()
 
@@ -117,31 +140,49 @@ if FRONTEND_DIR.is_dir():
         app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
 
 
-async def _read_upload(upload: UploadFile, field_name: str) -> tuple[bytes, str, str]:
+async def _store_upload(upload: UploadFile, field_name: str, job_prefix: str, side: int):
     if not upload.filename:
         raise HTTPException(
             status_code=400,
             detail={"error": f"Поле {field_name}: имя файла отсутствует"},
         )
-
-    content = await upload.read()
-    if not content:
+    suffix = Path(upload.filename).suffix.lower()
+    if suffix not in {".pdf", ".docx"}:
         raise HTTPException(
             status_code=400,
-            detail={"error": f"Поле {field_name}: файл пустой"},
+            detail={"error": f"Поле {field_name}: нужен файл .pdf или .docx"},
         )
-
-    if len(content) > settings.max_upload_bytes:
+    staging_key = f"staging/{job_prefix}/file{side}{suffix}"
+    try:
+        stored = await get_object_store().put_fileobj(
+            staging_key,
+            upload.file,
+            content_type=upload.content_type or "application/octet-stream",
+            max_bytes=settings.max_upload_bytes,
+        )
+    except ValueError as exc:
         raise HTTPException(
             status_code=413,
             detail={
                 "error": "Файл превышает допустимый размер",
                 "hint": f"Максимум {settings.max_upload_mb} МБ",
             },
+        ) from exc
+    if stored.size_bytes == 0:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": f"Поле {field_name}: файл пустой"},
         )
-
-    content_type = upload.content_type or "application/octet-stream"
-    return content, upload.filename, content_type
+    final_key = f"jobs/{job_prefix}/originals/file{side}-{stored.sha256}{suffix}"
+    if final_key != staging_key:
+        data = await get_object_store().get_bytes(staging_key)
+        stored = await get_object_store().put_bytes(
+            final_key,
+            data,
+            content_type=stored.content_type,
+        )
+        await get_object_store().delete(staging_key)
+    return stored, upload.filename, stored.content_type
 
 
 @app.get("/", include_in_schema=False)
@@ -158,6 +199,19 @@ async def frontend_index():
     )
 
 
+@app.get("/live", tags=["Health"])
+async def live() -> dict:
+    return {"status": "ok"}
+
+
+@app.get("/ready", tags=["Health"])
+async def ready() -> dict:
+    object_ok = await get_object_store().ping()
+    if not (_ready and object_ok):
+        raise HTTPException(status_code=503, detail="not ready")
+    return {"status": "ok", "object_store": object_ok, "outbox": _outbox is not None}
+
+
 @app.get("/health", tags=["Health"], summary="Проверка Chunking Service и Processing Service")
 async def health() -> dict:
     kafka_ok = is_kafka_producer_ready()
@@ -170,11 +224,13 @@ async def health() -> dict:
     except ProcessingServiceUnavailable as exc:
         processing_status = str(exc)
 
+    object_ok = await get_object_store().ping()
     return {
-        "status": "ok" if kafka_ok and processing_ok else "degraded",
+        "status": "ok" if object_ok else "degraded",
         "kafka_producer": kafka_ok,
         "processing_service_reachable": processing_ok,
         "processing": processing_status,
+        "object_store": object_ok,
     }
 
 
@@ -191,110 +247,62 @@ async def health() -> dict:
     summary="Разбить два файла на чанки и отправить в Kafka",
 )
 async def compare(
-    background_tasks: BackgroundTasks,
     user: AuthUser = Depends(get_current_user),
     file1: UploadFile = File(..., description="Первый файл (.pdf или .docx)"),
     file2: UploadFile = File(..., description="Второй файл (.pdf или .docx)"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> CompareResponse:
-    if not is_kafka_producer_ready():
+    if not await get_object_store().ping():
         return JSONResponse(
             status_code=503,
             content={
-                "error": "Сервис временно недоступен",
+                "error": "Хранилище файлов недоступно",
                 "hint": "Попробуйте ещё раз через минуту.",
             },
         )
 
-    content1, name1, type1 = await _read_upload(file1, "file1")
-    content2, name2, type2 = await _read_upload(file2, "file2")
+    ingress = DurableJobIngress(database.pool)
+    if idempotency_key:
+        existing = await ingress.lookup_idempotency(user.id, idempotency_key)
+        if existing is not None:
+            existing.pop("_request_hash", None)
+            return CompareResponse.model_validate(existing)
 
     job_id = str(uuid.uuid4())
-    user_id = str(user.id)
-    ws_url = settings.job_websocket_url(job_id)
-    stored1 = save_original(
-        user_id=user_id,
-        job_id=job_id,
-        side=1,
-        filename=name1,
-        content=content1,
-        content_type=type1,
-    )
-    stored2 = save_original(
-        user_id=user_id,
-        job_id=job_id,
-        side=2,
-        filename=name2,
-        content=content2,
-        content_type=type2,
-    )
-
+    stored1, name1, _type1 = await _store_upload(file1, "file1", job_id, 1)
+    stored2, name2, _type2 = await _store_upload(file2, "file2", job_id, 2)
     try:
-        await register_job(
-            job_id,
-            user_id=user_id,
-            status="preparing",
-            message="Подготовка документов…",
+        payload, _created = await ingress.create_or_resume(
+            user_id=user.id,
             file1_name=name1,
             file2_name=name2,
-            required=True,
-        )
-        await database.insert_job_file(
-            job_id=job_id,
-            side=1,
-            original_filename=name1,
-            content_type=stored1["content_type"],
-            size_bytes=stored1["size_bytes"],
-            sha256=stored1["sha256"],
-            storage_path=stored1["storage_path"],
-        )
-        await database.insert_job_file(
-            job_id=job_id,
-            side=2,
-            original_filename=name2,
-            content_type=stored2["content_type"],
-            size_bytes=stored2["size_bytes"],
-            sha256=stored2["sha256"],
-            storage_path=stored2["storage_path"],
-        )
-    except ProcessingServiceUnavailable as exc:
-        logger.error("[Compare ✗] job_id=%s registration failed: %s", job_id, exc)
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "Сервис обработки не готов",
-                "hint": "Задача не создана. Попробуйте ещё раз через минуту.",
+            object1={
+                "key": stored1.key,
+                "sha256": stored1.sha256,
+                "size_bytes": stored1.size_bytes,
+                "content_type": stored1.content_type,
             },
+            object2={
+                "key": stored2.key,
+                "sha256": stored2.sha256,
+                "size_bytes": stored2.size_bytes,
+                "content_type": stored2.content_type,
+            },
+            idempotency_key=idempotency_key,
+            job_id=job_id,
         )
+    except Exception:
+        await get_object_store().delete_prefix(f"jobs/{job_id}")
+        raise
 
-    # Return a job_id only after Processing has confirmed registration.
-    mark_job_accepted(job_id)
-    background_tasks.add_task(
-        run_compare_pipeline,
-        job_id,
-        content1,
-        name1,
-        content2,
-        name2,
-        user_id,
-    )
     logger.info(
-        "[Compare] job_id=%s user=%s accepted | file1=%s | file2=%s | ws=%s",
-        job_id,
+        "[Compare] job_id=%s user=%s accepted | file1=%s | file2=%s",
+        payload["job_id"],
         user.username,
         name1,
         name2,
-        ws_url,
     )
-
-    return CompareResponse(
-        job_id=job_id,
-        status="preparing",
-        total_chunks=0,
-        kafka_topic=settings.kafka_topic_raw_chunks,
-        websocket_url=ws_url,
-        file1=FileChunkStats(filename=name1, format="pending", chunks=0),
-        file2=FileChunkStats(filename=name2, format="pending", chunks=0),
-    )
+    return CompareResponse.model_validate(payload)
 
 
 @app.websocket("/ws/jobs/{job_id}")

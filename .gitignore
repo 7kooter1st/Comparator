@@ -21,4 +21,6 @@ Thumbs.db
 # Local tools
 .tools/
 
-# Uploaded originals (workspace-level data/uploads)
+# Runtime object store / uploads if created inside this repo.
+# Workspace copies live in ../data (outside this git root).
+/data/

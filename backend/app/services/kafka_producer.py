@@ -16,6 +16,10 @@ class KafkaProducerError(Exception):
     pass
 
 
+def get_kafka_producer():
+    return _producer
+
+
 def is_kafka_producer_ready() -> bool:
     return _producer is not None
 
@@ -42,6 +46,7 @@ async def start_kafka_producer() -> None:
     producer = AIOKafkaProducer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         acks="all",
+        enable_idempotence=True,
         max_request_size=settings.kafka_max_request_size_bytes,
     )
     try:
